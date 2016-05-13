@@ -1,0 +1,51 @@
+#The single-end reads were trimmed off using Trimommatic version 0.36
+java -jar Trimmomatic-0.32/trimmomatic-0.32.jar SE -phred33 /path/input.fq /path/output.fq ILLUMINACLIP:adapter.fa:2:30:20 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:50 # Trim the single-end reads
+#For the reads alignment, we applied three different aligners, BWA version 0.6.1-r104, Bowtie2 version 2.2.5 and MOSAIK version 2.1.
+#Bwa-mem
+bwa index Sbicolor_v3.0.fa # index sorghum reference by bwa
+bwa mem -M -R "@RG\tID:A01_788\tSM:A01_788" Sbicolor_v3.0.fa /path/A01_788.fq > A01_788.mem.sam # align sample to sorghum by bwa-mem
+#Bowtie2
+bowtie2-build Sbicolor_v3.0.fa Sbicolor_v3.0 # index sorghum reference by bowtie2
+bowtie2 --sensitive-local -x Sbicolor_v3.0 -q /path/A01_788.fq -S A01_788.bowt.sam # align sample to sorghum by bowtie2
+#Mosaik
+MosaikBuild -fr Sbicolor_v3.0.fa -oa Sorghum.dat
+MosaikJump -ia Sorghum.dat -hs 15 -out Sorghum_hs15
+MosaikBuild -q /path/A01_788.fq -st illumina -mfl 500 -out A01_788.dat
+MosaikAligner -annpe $HPC_MOSAIK_NET/2.1.26.pe.100.0065.ann -annse $HPC_MOSAIK_NET/2.1.26.se.100.005.ann -in A01_788.dat -out A01_788_align.dat -ia Sorghum.dat -j Sorghum_hs15 -mmp 5 # align sample to sorghum by Mosaik
+
+#Each accession’s alignment SAM file was converted into BAM file followed by binary compressing, sorting, and indexing using SAMtools.
+samtools view -S -b A01_788.mem.sam > A01_788.mem.bam
+samtools sort A01_788.mem.bam A01_788.mem.sorted
+samtools index A01_788.mem.sorted.bam
+
+#SNPs and InDels were called with three different variant callers, namely, Samtools (v 0.1), UnifiedGenotyper implemented in Genome Analysis ToolKit (GATK) v3.30, and Freebayes v 0.9.21-8-g819db2b respectively.
+#Samtools
+samtools mpileup -ugf Sbicolor_v3.0.fa A01_788_uniq.mem.sorted.bam A02_478_uniq.mem.sorted.bam B01_712_uniq.mem.sorted.bam B02_487_uniq.mem.sorted.bam C01_908_uniq.mem.sorted.bam C02_379_uniq.mem.sorted.bam D01_544_uniq.mem.sorted.bam D02_R570_uniq.mem.sorted.bam E01_541_uniq.mem.sorted.bam F01_581_uniq.mem.sorted.bam G01_801_uniq.mem.sorted.bam H01_381_uniq.mem.sorted.bam -q 30 -Q 20 -t DP,DV,DPR,INFO/DPR,DP4,SP | bcftools call -vmO z -o samtools-bwa.raw.vcf # variants calling by samtools
+#GATK
+java -jar /path/GenomeAnalysisTK.jar -T UnifiedGenotyper -glm BOTH -R Sbicolor_v3.0.fa -I A01_788_uniq.mem.sorted.bam -I A02_478_uniq.mem.sorted.bam -I B01_712_uniq.mem.sorted.bam -I B02_487_uniq.mem.sorted.bam -I C01_908_uniq.mem.sorted.bam -I C02_379_uniq.mem.sorted.bam -I D01_544_uniq.mem.sorted.bam -I D02_R570_uniq.mem.sorted.bam -I E01_541_uniq.mem.sorted.bam -I F01_581_uniq.mem.sorted.bam -I G01_801_uniq.mem.sorted.bam -I H01_381_uniq.mem.sorted.bam -ploidy 6  -mbq 20 -stand_call_conf 30 -stand_emit_conf 10 -o GATK_bwa_P6.raw.vcf # variants calling with ploidy level 6 by GATK
+#Freebayes
+freebayes -C 2 -0 -q 20 --min-coverage 5 -p 6 --use-best-n-alleles 5 -f Sbicolor_v3.0.fa -b 0-A01_788_uniq.mem.sorted.bam A02_478_uniq.mem.sorted.bam B01_712_uniq.mem.sorted.bam B02_487_uniq.mem.sorted.bam C01_908_uniq.mem.sorted.bam C02_379_uniq.mem.sorted.bam D01_544_uniq.mem.sorted.bam D02_R570_uniq.mem.sorted.bam E01_541_uniq.mem.sorted.bam F01_581_uniq.mem.sorted.bam G01_801_uniq.mem.sorted.bam H01_381_uniq.mem.sorted.bam -v Freebayes_bwa_P6.raw.vcf # variants calling with ploidy level 6 by freebayes
+#Filtering SNP from vcf file
+#SNP filter from samtools output
+tabix -p vcf samtools-bwa.raw.vcf.gz
+bcftools filter -O v -o  amtools-bwa.snp.vcf -i '%TYPE="snp" && %QUAL>=20 && %MIN(DP)>=35 ' samtools-bwa.raw.vcf.gz # extract SNP and preliminary filter
+bcftools filter -O v -o  samtools-bwa-DP600.snp.vcf -i ' MIN(DP/AN)>=25  ' samtools-bwa.snp.vcf  # filter SNP depth>=50
+bcftools filter -O v -o samtools-bwa-DP600-final.snp.vcf -e 'AC=AN ' samtools-bwa-DP600.snp.vcf  # filter SNP between sorghum and sugarcane
+
+#SNP filter from GATK output
+java -jar /path/GenomeAnalysisTK.jar -T SelectVariants -R Sbicolor_v3.0.fa -V GATK_bwa.raw.vcf -o .vcf -selectType SNP # extract SNP and preliminary filter
+java -jar /path/GenomeAnalysisTK.jar -T VariantFiltration -R Sbicolor_v3.0.fa -V GATK_bwa_P6_SNP.vcf --filterExpression "QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0" --filterName "my_snp_filter6" -o GATK_bwa_P6_flt.vcf # GATK specific filter
+java -jar /path/GenomeAnalysisTK.jar -T VariantFiltration -R Sbicolor_v3.0.fa -V GATK_bwa_P8_SNP.vcf --filterExpression "QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0" --filterName "my_snp_filter8" -o GATK_bwa_P8_flt.vcf # GATK specific filter
+java -jar /path/GenomeAnalysisTK.jar -T VariantFiltration -R Sbicolor_v3.0.fa -V GATK_bwa_P12_SNP.vcf --filterExpression "QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0" --filterName "my_snp_filter12" -o GATK_bwa_P12_flt.vcf # GATK specific filter
+
+#Extract genotype with same ploidy level from vcf file
+java -jar /path/GenomeAnalysisTK.jar -T SelectVariants -R Sbicolor_v3.0.fa -V GATK_bwa_P6_flt-2.vcf -o GATK_bwa_Ploidy6.vcf -sn A02_478 -sn C01_908 -sn D01_544 -sn E01_541 # Extract genotype with ploidy level 6 from vcf file
+java -jar /path/GenomeAnalysisTK.jar -T SelectVariants -R Sbicolor_v3.0.fa -V GATK_bwa_P8_flt-2.vcf -o GATK_bwa_Ploidy8.vcf -sn A01_788 -sn F01_581 -sn G01_801 -sn B02_487  -sn B01_712 -sn H01_381 # Extract genotype with ploidy level 8 from vcf file
+java -jar /path/GenomeAnalysisTK.jar -T SelectVariants -R Sbicolor_v3.0.fa -V GATK_bwa_P12_flt-2.vcf -o GATK_bwa_Ploidy12.vcf -sn C02_379 -sn D02_R570 # Extract genotype with ploidy level 12 from vcf file
+java -jar /path/GenomeAnalysisTK.jar -T CombineVariants -R Sbicolor_v3.0.fa --variant GATK_bwa_Ploidy6.vcf --variant GATK_bwa_Ploidy8.vcf --variant GATK_bwa_Ploidy12.vcf  -o GATK_bwa_combine.raw.vcf -genotypeMergeOptions UNIQUIFY # merge the 12 samples into one vcf file
+grep -v “AF=1” GATK_bwa_combine.raw.vcf > GATK_bwa_combine_SNP_isvar.vcf # Remove the SNP between sorghum and sugarcane
+java -jar /path/SnpSift.jar filter "(DP>=600)" GATK_bwa_combine_SNP_isvar.vcf > GATK_bwa_combine_isvar _SNP_DP600.vcf # filter SNP depth
+
+#SNP annotation
+java -jar /path/snpEff.jar -c snpEff.config -v Sbicolor_v3.0  -no-downstream -no-upstream /path/GATK_bwa_SNP_combine_isvar_DP600_final.vcf > GATK-no-up_bwa.eff.vcf
+
